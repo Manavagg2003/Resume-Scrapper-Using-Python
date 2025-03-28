@@ -1,49 +1,88 @@
-# import libraries
-
-from openai import OpenAI
+import requests
 import yaml
+import json
 
-api_key = None
-CONFIG_PATH = r"config.yaml"
+CONFIG_PATH = "config.yaml"
 
-with open(CONFIG_PATH) as file:
-    data = yaml.load(file, Loader=yaml.FullLoader)
-    api_key = data['OPENAI_API_KEY']
+# Extraction template for consistent JSON output
+EXTRACTION_TEMPLATE = """Extract the following ATS fields as JSON:
+{
+  "name": "Full name",
+  "email": "Email address",
+  "skills": ["list", "of", "skills"],
+  "experience": ["Position details"],
+  "education": ["Degree details"]
+}"""
+
+def load_api_key():
+    try:
+        with open(CONFIG_PATH) as file:
+            data = yaml.safe_load(file)
+            api_key = data.get('OPENROUTER_API_KEY') or data.get('openrouter')  # Common key names
+            
+            if not api_key:
+                raise ValueError("Add your OpenRouter API key to config.yaml:\nopenrouter: sk-or-...")
+                
+            return api_key
+            
+    except Exception as e:
+        raise RuntimeError(f"Config error: {str(e)}")
 
 def ats_extractor(resume_data):
-
-    prompt = '''
-    You are an AI bot designed to act as a professional for parsing resumes. You are given with resume and your job is to extract the following information from the resume:
-    1. full name
-    2. email id
-    3. github portfolio
-    4. linkedin id
-    5. employment details
-    6. technical skills
-    7. soft skills
-    Give the extracted information in json format only
-    '''
-
-    openai_client = OpenAI(
-        api_key = api_key
-    )    
-
-    messages=[
-        {"role": "system", 
-        "content": prompt}
-        ]
-    
-    user_content = resume_data
-    
-    messages.append({"role": "user", "content": user_content})
-
-    response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=messages,
-                temperature=0.0,
-                max_tokens=1500)
+    try:
+        api_key = load_api_key()
         
-    data = response.choices[0].message.content
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "YOUR_SITE_URL",  # Required by OpenRouter
+                "X-Title": "ATS Parser"  # Identify your app
+            },
+            json={
+                "model": "openai/gpt-4",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an ATS parser. Return ONLY valid JSON. Do not include explanations."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{EXTRACTION_TEMPLATE}\n\nResume data:\n{resume_data}"
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2000
+            },
+            timeout=20
+        )
 
-    #print(data)
-    return data
+        # Check for API errors
+        if 400 <= response.status_code < 500:
+            error_data = response.json().get('error', {})
+            return {
+                "error": f"API Client Error: {error_data.get('message', 'Unknown error')}",
+                "code": error_data.get('code'),
+                "type": error_data.get('type')
+            }
+
+        response.raise_for_status()
+        
+        content = response.json()["choices"][0]["message"]["content"]
+        
+        # Clean JSON response (sometimes contains markdown backticks)
+        cleaned = content.strip().replace('```json', '').replace('```', '')
+        
+        return {
+            "data": json.loads(cleaned),
+            "raw_response": content  # For debugging
+        }
+
+    except json.JSONDecodeError:
+        return {"error": "API returned invalid JSON", "raw_content": content}
+        
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Request failed: {str(e)}"}
+        
+    except Exception as e:
+        return {"error": f"Processing failed: {str(e)}"}
